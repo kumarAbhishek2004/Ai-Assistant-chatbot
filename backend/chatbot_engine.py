@@ -6,7 +6,6 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
 from langchain_core.tools import tool
 from dotenv import load_dotenv
-from ddgs import DDGS  # ✅ Updated import
 import sqlite3
 import requests
 import os
