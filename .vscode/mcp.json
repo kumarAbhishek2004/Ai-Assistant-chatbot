@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "animo": {
+      "command": "/opt/homebrew/bin/python3.11",
+      "args": [
+        "C:\\Users\\Kumar Abhishek\\.agi\\render.py"
+      ]
+    }
+  }
+}
