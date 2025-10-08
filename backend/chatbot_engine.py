@@ -1,29 +1,45 @@
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
-from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.tools import tool
 from dotenv import load_dotenv
+from ddgs import DDGS  # ✅ Updated import
 import sqlite3
 import requests
 import os
 
+# -------------------- LOAD ENV --------------------
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 
-# Initialize LLM
+# -------------------- LLM INITIALIZATION --------------------
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
     google_api_key=api_key,
 )
 
-# Initialize search tool
-search_tool = DuckDuckGoSearchRun(region="us-en")
+# -------------------- TOOLS --------------------
 
-# Define custom tools
+@tool
+def duckduckgo_search(query: str, max_results: int = 5) -> str:
+    """
+    Search DuckDuckGo and return summarized text for the model.
+    """
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return "Sorry, I couldn't find any top news related to that topic."
+        # Format title + URL for each result
+        formatted = "\n".join([f"- {r['title']}: {r['href']}" for r in results if r.get("title") and r.get("href")])
+        return formatted
+    except Exception as e:
+        return f"An error occurred: {e}"
+
+
 @tool
 def calculator(first_num: float, second_num: float, operation: str) -> dict:
     """
@@ -43,12 +59,12 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
             result = first_num / second_num
         else:
             return {"error": f"Unsupported operation '{operation}'"}
-        
+
         return {
             "first_num": first_num,
             "second_num": second_num,
             "operation": operation,
-            "result": result
+            "result": result,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -68,77 +84,65 @@ def get_stock_price(symbol: str) -> dict:
         return {"error": str(e)}
 
 
-# Combine all tools
-tools = [search_tool, get_stock_price, calculator]
+# -------------------- COMBINE TOOLS --------------------
+tools = [duckduckgo_search, get_stock_price, calculator]
 llm_with_tools = llm.bind_tools(tools)
 
-
-# Define state
+# -------------------- GRAPH STATE --------------------
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
-
-# Define chat node
+# -------------------- NODES --------------------
 def chat_node(state: ChatState):
-    messages = state['messages']
+    messages = state["messages"]
     response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
 
-# Define tool node manually (since ToolNode might not be available)
 def tool_node(state: ChatState):
-    """Execute tools based on tool calls in messages"""
-    messages = state['messages']
+    messages = state["messages"]
     last_message = messages[-1]
-    
-    tool_calls = getattr(last_message, 'tool_calls', [])
+    tool_calls = getattr(last_message, "tool_calls", [])
+
     if not tool_calls:
         return {"messages": []}
-    
+
     tool_messages = []
     for tool_call in tool_calls:
-        tool_name = tool_call['name']
-        tool_args = tool_call['args']
-        tool_id = tool_call['id']
-        
-        # Find and execute the tool
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+        tool_id = tool_call["id"]
+
+        # Execute the correct tool
         tool_result = None
-        for tool in tools:
-            if tool.name == tool_name:
+        for t in tools:
+            if t.name == tool_name:
                 try:
-                    tool_result = tool.invoke(tool_args)
+                    tool_result = t.invoke(tool_args)
                 except Exception as e:
                     tool_result = {"error": str(e)}
                 break
-        
-        # Create tool message
-        tool_message = ToolMessage(
-            content=str(tool_result),
-            tool_call_id=tool_id
-        )
+
+        tool_message = ToolMessage(content=str(tool_result), tool_call_id=tool_id)
         tool_messages.append(tool_message)
-    
+
     return {"messages": tool_messages}
 
 
-# Define tools condition manually
 def tools_condition(state: ChatState):
-    """Check if the last message has tool calls"""
-    messages = state['messages']
+    messages = state["messages"]
     if not messages:
         return "__end__"
-    
+
     last_message = messages[-1]
-    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         return "tools"
     return "__end__"
 
-
-# Setup SQLite checkpointer
-conn = sqlite3.connect(database='chatbot.db', check_same_thread=False)
+# -------------------- CHECKPOINT + GRAPH --------------------
+conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
 checkpointer = SqliteSaver(conn=conn)
 
-# Build the graph
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
 graph.add_node("tools", tool_node)
@@ -146,25 +150,65 @@ graph.add_node("tools", tool_node)
 graph.add_edge(START, "chat_node")
 graph.add_conditional_edges(
     "chat_node",
-    tools_condition,   
-    {"tools": "tools", "__end__": END}
+    tools_condition,
+    {"tools": "tools", "__end__": END},
 )
 graph.add_edge("tools", "chat_node")
 
-# Compile the chatbot
 chatbot = graph.compile(checkpointer=checkpointer)
 
-
+# -------------------- THREAD MANAGEMENT --------------------
 def retrieve_all_threads():
-    """
-    Return all threads with their friendly names from checkpoint config.
-    """
     all_threads = {}
     i = 1
     for checkpoint in checkpointer.list(None):
         cfg = checkpoint.config.get("configurable", {})
         thread_id = cfg.get("thread_id")
-        name = cfg.get("name", f"Chat {i}")
+        name = cfg.get("name")
+
+        if not name:
+            try:
+                config = {"configurable": {"thread_id": thread_id}}
+                state = chatbot.get_state(config=config)
+                messages = state.values.get("messages", []) if state.values else []
+
+                for msg in messages:
+                    if isinstance(msg, HumanMessage):
+                        name = msg.content[:50] + "..." if len(msg.content) > 50 else msg.content
+                        chatbot.update_state(
+                            config={"configurable": {"thread_id": thread_id, "name": name}},
+                            values=None,
+                        )
+                        break
+
+                if not name:
+                    name = f"Chat {i}"
+
+            except Exception as e:
+                print(f"Error generating name for thread {thread_id}: {e}")
+                name = f"Chat {i}"
+
         all_threads[thread_id] = name
         i += 1
+
     return all_threads
+
+# -------------------- TEST --------------------
+if __name__ == "__main__":
+    # Thread config for checkpointer
+    config = {"configurable": {"thread_id": "ai-news"}}
+
+    # User query
+    user_message = HumanMessage(content="AI latest news 2025")
+
+    # Invoke chatbot
+    response = chatbot.invoke(
+        {"messages": [user_message]},
+        config=config,
+    )
+
+    # Extract only the content from the first message in response
+    if response and "messages" in response:
+        for msg in response["messages"]:
+           
+            print(msg.content)
